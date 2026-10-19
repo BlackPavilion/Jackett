@@ -122,8 +122,11 @@ jobs:
           cp Jackett.Common.dll "$BUILD_CTX/Jackett.Common.dll"
 
           # Tags: :latest (para auto-update) + tag por commit (versionado).
+          # El nombre del repo en GHCR debe ser minúsculas (Docker lo exige);
+          # github.repository_owner puede traer mayúsculas (p. ej. BlackPavilion).
           COMMIT=$(git rev-parse --short HEAD)
-          REPO="ghcr.io/${{ github.repository_owner }}/jackett-grantorrent"
+          OWNER="${{ github.repository_owner }}"
+          REPO="ghcr.io/${OWNER,,}/jackett-grantorrent"
           echo ">> Imagen base: lscr.io/linuxserver/jackett:latest"
           echo ">> Tags: ${REPO}:latest y ${REPO}:${COMMIT}"
 
