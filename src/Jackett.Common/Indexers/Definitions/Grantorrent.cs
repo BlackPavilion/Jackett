@@ -96,51 +96,77 @@ namespace Jackett.Common.Indexers.Definitions
         {
             query = SanitizeTorznabQuery(query);
 
-            // the site has no category filter, so the TV/movie kind of each release is
-            // inferred. When the caller requests a specific kind of categories (Sonarr ->
-            // tvmovie=, Radarr -> movie=) that request is the most reliable signal: a TV
-            // search must yield TV releases even when the title has no SxxEyy/"Cap."/
-            // "Temporada" marker (otherwise Sonarr filters every result out and reports
-            // "no results in the configured categories").
+            // the site's search (?s=) only covers MOVIES; series live in a separate
+            // WordPress post type and are only returned when the search includes
+            // &filtro=series. When the caller requests a specific kind of categories
+            // (Sonarr -> TV categories, Radarr -> movie categories) that request is the
+            // most reliable signal: a TV search must yield TV releases even when the
+            // title has no SxxEyy/"Cap."/"Temporada" marker (otherwise Sonarr filters
+            // every result out and reports "no results in the configured categories").
+            // When the kind is not disambiguated (general search) both kinds are
+            // searched and merged.
             var forceTv = GetForcedTv(query);
 
-            // without a search term the site returns the latest releases (home page)
-            var searchUrl = query.SearchTerm.IsNullOrWhiteSpace()
-                ? SiteLink
-                : SiteLink + "?s=" + Uri.EscapeDataString(query.SearchTerm);
-
-            var result = await RequestWithCookiesAndRetryAsync(searchUrl, referer: SiteLink);
-            if (result.Status != HttpStatusCode.OK)
-                throw new ExceptionWithConfigData(result.ContentString, configData);
-
-            try
+            var releases = new List<ReleaseInfo>();
+            foreach (var searchUrl in BuildSearchUrls(query, forceTv))
             {
-                var parser = new HtmlParser();
-                using var dom = parser.ParseDocument(result.ContentString);
+                var result = await RequestWithCookiesAndRetryAsync(searchUrl, referer: SiteLink);
+                if (result.Status != HttpStatusCode.OK)
+                    throw new ExceptionWithConfigData(result.ContentString, configData);
 
-                var releases = new List<ReleaseInfo>();
-                foreach (var card in dom.QuerySelectorAll("div[x-data*='showDetail']"))
+                try
                 {
-                    var cardInfo = ParseCard(card);
-                    if (cardInfo == null)
-                        continue;
+                    var parser = new HtmlParser();
+                    using var dom = parser.ParseDocument(result.ContentString);
 
-                    // the search page only has the movie name; the quality/size/language
-                    // are only available in the detail page options table, so the detail
-                    // page is fetched per card and one release is emitted per download
-                    // option (accepted Jackett pattern: MejorTorrent, DonTorrent, AniDUB).
-                    var detailReleases = await ParseDetailReleases(cardInfo, query, forceTv);
-                    releases.AddRange(detailReleases);
+                    foreach (var card in dom.QuerySelectorAll("div[x-data*='showDetail']"))
+                    {
+                        var cardInfo = ParseCard(card);
+                        if (cardInfo == null)
+                            continue;
+
+                        // the search page only has the title; the quality/size/language
+                        // (movies) or the episode (series) are only available in the
+                        // detail page options table, so the detail page is fetched per
+                        // card and one release is emitted per download option (accepted
+                        // Jackett pattern: MejorTorrent, DonTorrent, AniDUB).
+                        var detailReleases = await ParseDetailReleases(cardInfo, query, forceTv);
+                        releases.AddRange(detailReleases);
+                    }
                 }
-
-                return releases;
+                catch (Exception ex)
+                {
+                    OnParseError(result.ContentString, ex);
+                }
             }
-            catch (Exception ex)
+
+            return releases;
+        }
+
+        /// <summary>
+        /// Builds the search URLs for the query. The site's search (?s=) only covers
+        /// movies; series require &filtro=series. Without a search term the home page
+        /// (latest movies) and the series listing (/series_p/) are used. When the kind
+        /// is not disambiguated (forceTv == null) both kinds are searched.
+        /// </summary>
+        private List<string> BuildSearchUrls(TorznabQuery query, bool? forceTv)
+        {
+            var urls = new List<string>();
+            if (query.SearchTerm.IsNullOrWhiteSpace())
             {
-                OnParseError(result.ContentString, ex);
+                if (forceTv != true)
+                    urls.Add(SiteLink); // home page (latest movies)
+                if (forceTv != false)
+                    urls.Add(SiteLink + "series_p/"); // series listing
+                return urls;
             }
 
-            return new List<ReleaseInfo>();
+            var s = "?s=" + Uri.EscapeDataString(query.SearchTerm);
+            if (forceTv != true)
+                urls.Add(SiteLink + s); // plain ?s= = movies
+            if (forceTv != false)
+                urls.Add(SiteLink + s + "&filtro=series");
+            return urls;
         }
 
         private CardInfo ParseCard(IElement card)
@@ -188,24 +214,34 @@ namespace Jackett.Common.Indexers.Definitions
                 return new List<ReleaseInfo>();
             }
 
+            // series live under /series/<slug>/; movies are at the root (/<slug>/).
+            // The URL is the authoritative signal for the kind (the site's search does
+            // not mix the two kinds).
+            var isSeries = IsSeriesDetail(card.Details);
+
             var parser = new HtmlParser();
             using var dom = parser.ParseDocument(detailPage.ContentString);
 
-            // the <h1> of the detail page has the movie title with the year
-            // (e.g. "Buscando a Dory (2016)"). The year is REQUIRED in the release
+            // the <h1> of a MOVIE detail page has the title with the year
+            // (e.g. "Buscando a Dory (2016)"). The year is REQUIRED in the movie release
             // title: Radarr's movie-title parser only matches titles that contain a
             // 4-digit year, so without it the release is rejected with
-            // "Unable to parse release". Falls back to the year from the search
-            // query when the heading has none.
-            var year = ParseYearFromHeading(dom.QuerySelector("h1")?.TextContent);
-            if (!year.HasValue && query.Year > 0)
-                year = query.Year;
+            // "Unable to parse release". Falls back to the year from the search query
+            // when the heading has none. Series headings have no year (and Sonarr does
+            // not use years for TV), so no year is added for series.
+            int? year = null;
+            if (!isSeries)
+            {
+                year = ParseYearFromHeading(dom.QuerySelector("h1")?.TextContent);
+                if (!year.HasValue && query.Year > 0)
+                    year = query.Year;
+            }
 
             var releases = new List<ReleaseInfo>();
             var rows = dom.QuerySelectorAll("tr[wire\\:key]");
             for (var i = 0; i < rows.Length; i++)
             {
-                var release = ParseOptionRow(card, rows[i], i, year, forceTv);
+                var release = ParseOptionRow(card, rows[i], i, year, forceTv, isSeries);
                 if (release != null)
                     releases.Add(release);
             }
@@ -217,39 +253,62 @@ namespace Jackett.Common.Indexers.Definitions
         /// Parses a single row of the options table into a release. Returns null when the
         /// row has no data-src attribute (not downloadable) or too few cells.
         /// </summary>
-        private ReleaseInfo ParseOptionRow(CardInfo card, IElement row, int optionIndex, int? year, bool? forceTv)
+        private ReleaseInfo ParseOptionRow(CardInfo card, IElement row, int optionIndex, int? year, bool? forceTv, bool isSeries)
         {
             var downloadButton = row.QuerySelector("a.linktorrent");
             var dataSrc = downloadButton?.GetAttribute("data-src");
             if (dataSrc.IsNullOrWhiteSpace())
                 return null; // skip rows without data-src (not downloadable)
 
-            // <td> cells: Idioma | Formato | Calidad | Peso | Opcion 1
             var cells = row.QuerySelectorAll("td");
             if (cells.Length < 4)
                 return null;
 
             var language = ParseLanguage(cells[0]);
-            var formato = cells[1].TextContent.Trim();
-            var calidad = cells[2].TextContent.Trim();
-            var peso = cells[3].TextContent.Trim();
 
-            var quality = MapQuality(GetQuality(formato, calidad));
+            string quality;
+            string episode = null;
+            string peso;
+            if (isSeries)
+            {
+                // series table: Idioma | Episodios | Peso | Clave | Opcion 1
+                // (no quality column; the episode is in the "Episodios" column)
+                episode = NormalizeEpisode(cells[1]?.TextContent);
+                peso = cells[2]?.TextContent ?? "";
+                quality = null;
+            }
+            else
+            {
+                // movie table: Idioma | Formato | Calidad | Peso | Opcion 1
+                var formato = cells[1].TextContent.Trim();
+                var calidad = cells[2].TextContent.Trim();
+                peso = cells[3].TextContent.Trim();
+                quality = MapQuality(GetQuality(formato, calidad));
+            }
+
             var size = ParseSize(peso);
             if (size <= 0)
                 size = EstimateSize(quality);
 
             // the title includes the year, the quality and the language so
             // Radarr/Sonarr can parse it (e.g. "Buscando a Dory (2016) DVDRip SPANISH").
-            // The year is required (without it Radarr rejects the release with
-            // "Unable to parse release") and the language token is required to pass
-            // the language profile (otherwise Radarr falls back to the movie's
-            // original language, e.g. English for "Finding Dory").
+            // The year is required for movies (without it Radarr rejects the release
+            // with "Unable to parse release") and the language token is required to
+            // pass the language profile. For series the title includes the episode
+            // (SxxEyy) so Sonarr can match it (no year, no quality).
             var title = card.Title;
-            if (year.HasValue && !HasYear(title))
-                title += " (" + year.Value + ")";
-            if (quality.IsNotNullOrWhiteSpace())
-                title += " " + quality;
+            if (isSeries)
+            {
+                if (episode.IsNotNullOrWhiteSpace())
+                    title += " " + episode;
+            }
+            else
+            {
+                if (year.HasValue && !HasYear(title))
+                    title += " (" + year.Value + ")";
+                if (quality.IsNotNullOrWhiteSpace())
+                    title += " " + quality;
+            }
             if (language.IsNotNullOrWhiteSpace())
                 title += " " + language;
 
@@ -263,7 +322,7 @@ namespace Jackett.Common.Indexers.Definitions
                 Details = card.Details,
                 Link = link,
                 Guid = link,
-                Category = MapTrackerCatToNewznab(ParseCategory(card.Title, quality, forceTv)),
+                Category = MapTrackerCatToNewznab(ParseCategory(card.Title, quality, forceTv, isSeries)),
                 PublishDate = card.PublishDate ?? DateTime.Now,
                 Size = size,
                 Seeders = 1,
@@ -414,6 +473,42 @@ namespace Jackett.Common.Indexers.Definitions
         }
 
         /// <summary>
+        /// Returns true when the detail URL is a series. Series live under /series/&lt;slug&gt;/
+        /// and movies are at the root (/&lt;slug&gt;/). The URL is the authoritative signal for
+        /// the kind (the site's search does not mix the two kinds).
+        /// </summary>
+        private static bool IsSeriesDetail(Uri details)
+        {
+            return details != null && details.AbsolutePath.StartsWith("/series/", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Normalizes the "Episodios" cell of a series row (e.g. "6x1") to the SxxEyy
+        /// format (e.g. "S06E01") so Sonarr can match the episode. Returns null when the
+        /// value is empty or not a recognizable episode.
+        /// </summary>
+        private static string NormalizeEpisode(string episode)
+        {
+            if (episode.IsNullOrWhiteSpace())
+                return null;
+
+            var e = episode.Trim();
+            // "6x1" -> "S06E01"
+            var match = Regex.Match(e, @"^(\d{1,3})\s*[xX]\s*(\d{1,4})$");
+            if (match.Success)
+                return "S" + int.Parse(match.Groups[1].Value).ToString("D2")
+                       + "E" + int.Parse(match.Groups[2].Value).ToString("D2");
+
+            // already "S06E01"
+            match = Regex.Match(e, @"^S(\d{1,3})E(\d{1,4})$", RegexOptions.IgnoreCase);
+            if (match.Success)
+                return "S" + int.Parse(match.Groups[1].Value).ToString("D2")
+                       + "E" + int.Parse(match.Groups[2].Value).ToString("D2");
+
+            return null;
+        }
+
+        /// <summary>
         /// Determines the quality of a row. The "Formato" column has the real quality
         /// (e.g. HDRip, MicroHD-1080p, BluRay-1080p, BDRemux-1080p, 3D); the "Calidad"
         /// column is usually empty. When "Formato" is a container (e.g. MKV) or empty,
@@ -561,9 +656,19 @@ namespace Jackett.Common.Indexers.Definitions
         public static string ToFunctionalTorrentUrl(string decodedUrl)
         {
             var uri = new Uri(decodedUrl);
-            if (uri.Host == FilesHost && uri.AbsolutePath.StartsWith("/files/", StringComparison.Ordinal))
-                return uri.AbsoluteUri;
+            if (uri.Host == FilesHost)
+            {
+                // the host is already the functional one. Movies use /files/... paths and
+                // series use /wp-content/uploads/... paths (both are served directly).
+                // Only a bare /torrents/... path (the movie pattern without the /files/
+                // prefix) needs the prefix added (defensive, A1 H1/H2 / A3).
+                if (uri.AbsolutePath.StartsWith("/files/", StringComparison.Ordinal)
+                    || uri.AbsolutePath.StartsWith("/wp-content/", StringComparison.Ordinal))
+                    return uri.AbsoluteUri;
+                return FilesBase + uri.AbsolutePath;
+            }
 
+            // the host is dead (e.g. dl.grantorrent.wf): rebuild on the functional host
             return FilesBase + uri.AbsolutePath;
         }
 
@@ -687,16 +792,15 @@ namespace Jackett.Common.Indexers.Definitions
             return null;
         }
 
-        private static string ParseCategory(string title, string quality, bool? forceTv)
+        private static string ParseCategory(string title, string quality, bool? forceTv, bool isSeries)
         {
-            // the site does not expose a reliable content category in the URL (A1 H7):
-            // the 18 sidebar categories are genres, not Torznab categories.
-            // When the caller requested a specific kind of categories (forceTv != null)
-            // that is the authoritative signal; otherwise fall back to the title
-            // heuristic: SxxEyy / "Cap." / "Temporada" in the title.
-            var isTvShow = forceTv ?? (Regex.IsMatch(title, @"S\d{1,2}E\d{1,3}")
+            // the detail URL is the authoritative signal for the kind: series live under
+            // /series/<slug>/ (the site's search does not mix the two kinds). When the
+            // URL does not disambiguate (movie at the root), fall back to the forceTv
+            // request and then the title heuristic: SxxEyy / "Cap." / "Temporada".
+            var isTvShow = isSeries || (forceTv ?? (Regex.IsMatch(title, @"S\d{1,2}E\d{1,3}")
                            || Regex.IsMatch(title, @"Cap\.?\s*\d+", RegexOptions.IgnoreCase)
-                           || title.IndexOf("Temporada", StringComparison.OrdinalIgnoreCase) >= 0);
+                           || title.IndexOf("Temporada", StringComparison.OrdinalIgnoreCase) >= 0));
 
             var q = (quality ?? "").ToLowerInvariant();
             var tier =

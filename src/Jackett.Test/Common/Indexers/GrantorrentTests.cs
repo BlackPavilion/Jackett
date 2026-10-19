@@ -35,6 +35,8 @@ namespace Jackett.Test.Common.Indexers
             // release is emitted per download option (row of the options table)
             var webClient = new TestWebClient();
             webClient.RegisterRequestCallback("https://grantorrent.foo/?s=dory", "grantorrent-search-multi.html");
+            // a general search (no categories) also searches series; "dory" has none
+            webClient.RegisterRequestCallback("https://grantorrent.foo/?s=dory&filtro=series", "grantorrent-search-empty.html");
             webClient.RegisterRequestCallback("https://grantorrent.foo/buscando-a-dory/", "grantorrent-detail-dory.html");
             webClient.RegisterRequestCallback("https://grantorrent.foo/operacion-dragon/", "grantorrent-detail.html");
             var indexer = NewIndexer(webClient);
@@ -93,32 +95,44 @@ namespace Jackett.Test.Common.Indexers
         [Test]
         public async Task TestPerformQueryTvCategoriesForceTvAsync()
         {
-            // Same search/detail pages as TestPerformQuerySearchAsync, but the query requests
-            // TV categories (tvmovie=). "Buscando a Dory" has no SxxEyy/"Cap."/Temporada marker
-            // in the title, so the title heuristic would classify it as a movie; the TV category
-            // request must force the TV kind instead (otherwise Sonarr filters every result out
-            // and reports "no results in the configured categories").
+            // A TV category request (tvmovie=) searches SERIES (?s=...&filtro=series), because
+            // the site's plain search (?s=) only covers movies. The series are categorized as
+            // TV (the /series/ URL is the authoritative signal), so Sonarr finds them in the
+            // configured categories (otherwise it reports "no results in the configured
+            // categories").
             var webClient = new TestWebClient();
-            webClient.RegisterRequestCallback("https://grantorrent.foo/?s=dory", "grantorrent-search-multi.html");
-            webClient.RegisterRequestCallback("https://grantorrent.foo/buscando-a-dory/", "grantorrent-detail-dory.html");
-            webClient.RegisterRequestCallback("https://grantorrent.foo/operacion-dragon/", "grantorrent-detail.html");
+            webClient.RegisterRequestCallback("https://grantorrent.foo/?s=peaky&filtro=series", "grantorrent-search-series.html");
+            webClient.RegisterRequestCallback("https://grantorrent.foo/series/peaky-blinders/", "grantorrent-detail-series.html");
+            webClient.RegisterRequestCallback("https://grantorrent.foo/series/the-pitt/", "grantorrent-detail-series.html");
             var indexer = NewIndexer(webClient);
 
             var result = await indexer.ResultsForQuery(
-                new TorznabQuery { QueryType = "search", SearchTerm = "dory", Categories = new[] { 5000, 5030, 5040, 5045 } }, false);
+                new TorznabQuery { QueryType = "tvsearch", SearchTerm = "peaky", Categories = new[] { 5000, 5030, 5040, 5045 } }, false);
             var releases = result.Releases.ToList();
 
-            releases.Should().HaveCount(5);
+            // 2 series cards, each with 2 downloadable rows (row 2 has no data-src, skipped)
+            // => 4 releases
+            releases.Should().HaveCount(4);
 
-            // DVDRip (SD) => TV/SD (5030), not Movies/SD (2030)
-            var hdrip = releases.Single(r => r.Title == "Buscando a Dory (2016) DVDRip SPANISH");
-            hdrip.Category.Should().Contain(TorznabCatType.TVSD.ID);
-            hdrip.Category.Should().NotContain(TorznabCatType.MoviesSD.ID);
+            // all releases are categorized as TV (not movies)
+            releases.Should().OnlyContain(r => r.Category.Contains(TorznabCatType.TV.ID));
+            releases.Should().NotContain(r => r.Category.Contains(TorznabCatType.Movies.ID));
 
-            // MicroHD-1080p (HD) => TV/HD (5040), not Movies/HD (2040)
-            var microhd = releases.Single(r => r.Title == "Buscando a Dory (2016) MicroHD-1080p SPANISH");
-            microhd.Category.Should().Contain(TorznabCatType.TVHD.ID);
-            microhd.Category.Should().NotContain(TorznabCatType.MoviesHD.ID);
+            // the episode is included in the title (SxxEyy) so Sonarr can match it; no year
+            // and no quality (series have neither)
+            var s01e01 = releases.Single(r => r.Title == "Peaky Blinders S01E01 SPANISH");
+            s01e01.Category.Should().Contain(TorznabCatType.TV.ID);
+            s01e01.Link.Should().Be(new Uri("https://grantorrent.foo/series/peaky-blinders/?opt=0"));
+            s01e01.Guid.Should().Be(s01e01.Link);
+            s01e01.Details.Should().Be(new Uri("https://grantorrent.foo/series/peaky-blinders/"));
+
+            // row 0 has "0GB" (unparseable) => the size falls back to the estimate (2 GB)
+            s01e01.Size.Should().Be(2L * 1024 * 1024 * 1024);
+
+            // row 1 has "1.5GB" => the real size
+            var s01e02 = releases.Single(r => r.Title == "Peaky Blinders S01E02 SPANISH");
+            s01e02.Size.Should().Be((long)(1.5 * 1024 * 1024 * 1024));
+            s01e02.Link.Should().Be(new Uri("https://grantorrent.foo/series/peaky-blinders/?opt=1"));
         }
 
         [Test]
@@ -132,6 +146,23 @@ namespace Jackett.Test.Common.Indexers
             var indexer = NewIndexer(_webClient);
 
             var bytes = await indexer.Download(new Uri("https://grantorrent.foo/operacion-dragon/"));
+
+            var expected = TestUtil.LoadTestFile("grantorrent-sample.torrent");
+            bytes.Should().Equal(Encoding.UTF8.GetBytes(expected));
+        }
+
+        [Test]
+        public async Task TestDownloadSeriesAsync()
+        {
+            // a series detail page (/series/<slug>/): the data-src decodes to a
+            // /wp-content/uploads/... path on the functional host (used as-is, no
+            // /files/ prefix). The option index (?opt=N) selects the row.
+            _webClient.RegisterRequestCallback("https://grantorrent.foo/series/peaky-blinders/", "grantorrent-detail-series.html");
+            _webClient.RegisterRequestCallback("https://grantorrent.foo/wp-content/uploads/2026/03/Peaky-Blinders2-(central).torrent", "grantorrent-sample.torrent");
+            var indexer = NewIndexer(_webClient);
+
+            // opt=1 => row 1 => Peaky-Blinders2
+            var bytes = await indexer.Download(new Uri("https://grantorrent.foo/series/peaky-blinders/?opt=1"));
 
             var expected = TestUtil.LoadTestFile("grantorrent-sample.torrent");
             bytes.Should().Equal(Encoding.UTF8.GetBytes(expected));
@@ -152,6 +183,8 @@ namespace Jackett.Test.Common.Indexers
         {
             // a search with zero results: the page has the movie-list container but no cards
             _webClient.RegisterRequestCallback("https://grantorrent.foo/?s=the%20pitt", "grantorrent-search-empty.html");
+            // a general search (no categories) also searches series; "the pitt" has none here
+            _webClient.RegisterRequestCallback("https://grantorrent.foo/?s=the%20pitt&filtro=series", "grantorrent-search-empty.html");
             var indexer = NewIndexer(_webClient);
 
             var result = await indexer.ResultsForQuery(new TorznabQuery { QueryType = "search", SearchTerm = "the pitt" }, false);
@@ -162,8 +195,10 @@ namespace Jackett.Test.Common.Indexers
         [Test]
         public async Task TestPerformQueryHomePageAsync()
         {
-            // no search term => the site link (home page) is requested; empty page => 0 releases
+            // no search term => the home page (latest movies) and the series listing are
+            // requested; both empty => 0 releases
             _webClient.RegisterRequestCallback("https://grantorrent.foo/", "grantorrent-search-empty.html");
+            _webClient.RegisterRequestCallback("https://grantorrent.foo/series_p/", "grantorrent-search-empty.html");
             var indexer = NewIndexer(_webClient);
 
             var result = await indexer.ResultsForQuery(new TorznabQuery { QueryType = "search" }, false);
@@ -179,6 +214,8 @@ namespace Jackett.Test.Common.Indexers
             // throw because "?s=dory%202024" is not mocked)
             var webClient = new TestWebClient();
             webClient.RegisterRequestCallback("https://grantorrent.foo/?s=dory", "grantorrent-search-multi.html");
+            // a general search (no categories) also searches series; "dory" has none
+            webClient.RegisterRequestCallback("https://grantorrent.foo/?s=dory&filtro=series", "grantorrent-search-empty.html");
             webClient.RegisterRequestCallback("https://grantorrent.foo/buscando-a-dory/", "grantorrent-detail-dory.html");
             webClient.RegisterRequestCallback("https://grantorrent.foo/operacion-dragon/", "grantorrent-detail.html");
             var indexer = NewIndexer(webClient);
@@ -192,6 +229,8 @@ namespace Jackett.Test.Common.Indexers
         public async Task TestPerformQueryEdgeCasesAsync()
         {
             _webClient.RegisterRequestCallback("https://grantorrent.foo/?s=edge", "grantorrent-search-edge.html");
+            // a general search (no categories) also searches series; "edge" has none
+            _webClient.RegisterRequestCallback("https://grantorrent.foo/?s=edge&filtro=series", "grantorrent-search-empty.html");
             // the detail page is fetched per card; all cards use the same single-row fixture
             // (quality HDRip, 1.5 Gb.) so the category is determined by the detail quality
             // and the TV/movie heuristic from the title
@@ -266,6 +305,8 @@ namespace Jackett.Test.Common.Indexers
             // The relative poster is resolved against the site link and the other
             // releases are not lost.
             _webClient.RegisterRequestCallback("https://grantorrent.foo/?s=poster", "grantorrent-search-relativeposter.html");
+            // a general search (no categories) also searches series; "poster" has none
+            _webClient.RegisterRequestCallback("https://grantorrent.foo/?s=poster&filtro=series", "grantorrent-search-empty.html");
             _webClient.RegisterRequestCallback("https://grantorrent.foo/pelicula-absoluta/", "grantorrent-detail-single.html");
             _webClient.RegisterRequestCallback("https://grantorrent.foo/pelicula-relativa/", "grantorrent-detail-single.html");
             _webClient.RegisterRequestCallback("https://grantorrent.foo/pelicula-control/", "grantorrent-detail-single.html");
@@ -493,6 +534,11 @@ namespace Jackett.Test.Common.Indexers
                 yield return new TestCaseData(
                     "https://grantorrent.foo/torrents/peliculas/Operacion-dragon.mkv80.torrent",
                     "https://grantorrent.foo/files/torrents/peliculas/Operacion-dragon.mkv80.torrent");
+                // series: the data-src decodes to a /wp-content/uploads/... path on the
+                // functional host => it is used as-is (no /files/ prefix)
+                yield return new TestCaseData(
+                    "https://grantorrent.foo/wp-content/uploads/2026/03/Peaky-Blinders861-(central).torrent",
+                    "https://grantorrent.foo/wp-content/uploads/2026/03/Peaky-Blinders861-(central).torrent");
             }
         }
     }
