@@ -88,21 +88,60 @@ jobs:
           dotnet-version: '9.0.x'
 
       # ------------------------------------------------------------------
-      # 4. Compilar Jackett.Common.dll (con el indexador Grantorrent).
+      # 4. Leer la versión de Jackett.Common de la imagen base oficial.
+      #    CRÍTICO: el DLL parcheado debe compilar con la MISMA versión que
+      #    la imagen base, porque jackett.dll (de la imagen base) referencia
+      #    Jackett.Common con esa versión. Si el DLL tiene otra versión
+      #    (p. ej. 0.0.0.0), CoreCLR rechaza la carga en el check de
+      #    compatibilidad de versiones (found < requested) y el contenedor
+      #    entra en bootloop con FileNotFoundException.
+      # ------------------------------------------------------------------
+      - name: Get base image Jackett.Common version
+        id: basever
+        run: |
+          set -euo pipefail
+          docker pull lscr.io/linuxserver/jackett:latest
+          docker create --name jver lscr.io/linuxserver/jackett:latest
+          docker cp jver:/app/Jackett/jackett.deps.json /tmp/jackett.deps.json
+          docker rm jver
+          VER=$(python3 -c "
+          import json
+          d = json.load(open('/tmp/jackett.deps.json'))
+          for name in d.get('libraries', {}):
+              if name.startswith('Jackett.Common/'):
+                  print(name.split('/')[1])
+                  break
+          ")
+          if [ -z "$VER" ]; then
+            echo "ERROR: no se pudo leer la versión de Jackett.Common de la imagen base"
+            exit 1
+          fi
+          echo ">> Versión de Jackett.Common en la imagen base: $VER"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # 5. Compilar Jackett.Common.dll (con el indexador Grantorrent).
       #    Solo se compila Jackett.Common (el proyecto que contiene el
       #    indexador); sus dependencias se resuelven automáticamente.
+      #    Se compila con la versión de la imagen base (ver paso anterior).
       # ------------------------------------------------------------------
       - name: Build Jackett.Common.dll
         run: |
           set -euo pipefail
-          dotnet build src/Jackett.Common/Jackett.Common.csproj -c Release -f net9.0
+          # /p:Version=... es OBLIGATORIO: sin él el DLL sale con 0.0.0.0
+          # (por src/Directory.Build.props) y CoreCLR no lo carga.
+          dotnet build src/Jackett.Common/Jackett.Common.csproj -c Release -f net9.0 \
+            /p:Version=${{ steps.basever.outputs.version }} \
+            /p:AssemblyVersion=${{ steps.basever.outputs.version }} \
+            /p:FileVersion=${{ steps.basever.outputs.version }} \
+            /p:InformationalVersion=${{ steps.basever.outputs.version }}
           # Copiar el DLL a la raíz para el contexto de build de Docker.
           cp src/Jackett.Common/bin/Release/net9.0/Jackett.Common.dll ./Jackett.Common.dll
-          echo ">> Jackett.Common.dll generado:"
+          echo ">> Jackett.Common.dll generado (versión ${{ steps.basever.outputs.version }}):"
           ls -la ./Jackett.Common.dll
 
       # ------------------------------------------------------------------
-      # 5. Login a GHCR (con el GITHUB_TOKEN, que tiene packages: write).
+      # 6. Login a GHCR (con el GITHUB_TOKEN, que tiene packages: write).
       # ------------------------------------------------------------------
       - name: Login to GHCR
         run: |
