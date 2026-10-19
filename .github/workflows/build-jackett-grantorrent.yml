@@ -1,0 +1,137 @@
+# =============================================================================
+# Pipeline: Jackett oficial + indexador Grantorrent (imagen parcheada)
+#
+# Qué hace:
+#   1. Mergea upstream (Jackett/Jackett:master) en el branch grantorrent-indexer
+#      (que contiene el indexador Grantorrent). Así el branch siempre = última
+#      upstream + indexador.
+#   2. Compila Jackett.Common.dll (el único binario que contiene el indexador).
+#   3. Construye una imagen "parcheada": FROM lscr.io/linuxserver/jackett:latest
+#      + reemplazo de Jackett.Common.dll (ver Dockerfile.grantorrent).
+#   4. La pusha a GHCR (ghcr.io/blackpavilion/jackett-grantorrent).
+#
+# En el NAS, el contenedor de Jackett usa esta imagen (tag :latest) y se
+# actualiza automáticamente (Watchtower tira la nueva :latest de GHCR).
+#
+# Seguridad: si el merge o el build fallan, el workflow falla y la imagen
+# anterior sigue en producción (no se rompe nada).
+#
+# Trigger:
+#   - schedule: diario a las 03:00 UTC (antes de las 04:00 de Watchtower).
+#   - workflow_dispatch: manual (para probar o forzar una actualización).
+# =============================================================================
+name: Build Jackett Grantorrent
+
+on:
+  schedule:
+    # Diario a las 03:00 UTC (1:00 AM en Madrid en invierno / 2:00 en verano).
+    # Antes de que Watchtower (04:00) tire la imagen nueva.
+    - cron: '0 3 * * *'
+  workflow_dispatch: {}
+
+# Permisos mínimos:
+#   contents: write -> para push del merge commit al branch.
+#   packages: write -> para push de la imagen a GHCR.
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      # ------------------------------------------------------------------
+      # 1. Checkout del branch (historial completo para poder mergear).
+      # ------------------------------------------------------------------
+      - name: Checkout grantorrent-indexer
+        uses: actions/checkout@v4
+        with:
+          ref: grantorrent-indexer
+          fetch-depth: 0
+
+      # ------------------------------------------------------------------
+      # 2. Merge de upstream/master en el branch.
+      #    Si hay conflicto, el merge falla y el workflow se detiene
+      #    (la imagen anterior sigue en producción).
+      # ------------------------------------------------------------------
+      - name: Merge upstream/master
+        id: merge
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/Jackett/Jackett.git
+          git fetch upstream --tags
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # ¿Ya está actualizado? (evita merge commits innecesarios)
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/master)
+          MERGE_BASE=$(git merge-base HEAD upstream/master)
+
+          if [ "$LOCAL" = "$UPSTREAM" ] || [ "$MERGE_BASE" = "$UPSTREAM" ]; then
+            echo ">> El branch ya está al día con upstream/master. Sin merge."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo ">> Mergeando upstream/master en grantorrent-indexer..."
+            git merge upstream/master --no-edit
+            git push origin HEAD:grantorrent-indexer
+            echo ">> Merge pushado al branch."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ------------------------------------------------------------------
+      # 3. Setup de .NET 9.0 (la versión que usa Jackett y la imagen oficial).
+      # ------------------------------------------------------------------
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      # ------------------------------------------------------------------
+      # 4. Compilar Jackett.Common.dll (con el indexador Grantorrent).
+      #    Solo se compila Jackett.Common (el proyecto que contiene el
+      #    indexador); sus dependencias se resuelven automáticamente.
+      # ------------------------------------------------------------------
+      - name: Build Jackett.Common.dll
+        run: |
+          set -euo pipefail
+          dotnet build src/Jackett.Common/Jackett.Common.csproj -c Release -f net9.0
+          # Copiar el DLL a la raíz para el contexto de build de Docker.
+          cp src/Jackett.Common/bin/Release/net9.0/Jackett.Common.dll ./Jackett.Common.dll
+          echo ">> Jackett.Common.dll generado:"
+          ls -la ./Jackett.Common.dll
+
+      # ------------------------------------------------------------------
+      # 5. Login a GHCR (con el GITHUB_TOKEN, que tiene packages: write).
+      # ------------------------------------------------------------------
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            -u "${{ github.actor }}" --password-stdin
+
+      # ------------------------------------------------------------------
+      # 6. Construir la imagen parcheada y push a GHCR.
+      #    Contexto mínimo (solo Dockerfile + DLL) para un build rápido.
+      # ------------------------------------------------------------------
+      - name: Build and push image
+        run: |
+          set -euo pipefail
+          # Contexto mínimo para el build de Docker.
+          BUILD_CTX=$(mktemp -d)
+          cp Dockerfile.grantorrent "$BUILD_CTX/Dockerfile"
+          cp Jackett.Common.dll "$BUILD_CTX/Jackett.Common.dll"
+
+          # Tags: :latest (para auto-update) + tag por commit (versionado).
+          COMMIT=$(git rev-parse --short HEAD)
+          REPO="ghcr.io/${{ github.repository_owner }}/jackett-grantorrent"
+          echo ">> Imagen base: lscr.io/linuxserver/jackett:latest"
+          echo ">> Tags: ${REPO}:latest y ${REPO}:${COMMIT}"
+
+          docker build -f "$BUILD_CTX/Dockerfile" \
+            -t "${REPO}:latest" \
+            -t "${REPO}:${COMMIT}" \
+            "$BUILD_CTX"
+
+          docker push "${REPO}:latest"
+          docker push "${REPO}:${COMMIT}"
+          echo ">> Imagen pushada a GHCR: ${REPO}:latest (${COMMIT})"
