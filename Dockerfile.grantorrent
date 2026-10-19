@@ -1,0 +1,25 @@
+# =============================================================================
+# Imagen "parcheada" de Jackett: imagen oficial de linuxserver.io + el
+# indexador Grantorrent (compilado en Jackett.Common.dll).
+#
+# Estrategia:
+#   - PARTIR de la imagen oficial (lscr.io/linuxserver/jackett:latest) para
+#     heredar toda su base: OS, entrypoint /init (s6), manejo de config,
+#     permisos PUID/PGID, carpeta Definitions/, etc.
+#   - REEMPLAZAR solo Jackett.Common.dll (el único binario que contiene el
+#     indexador Grantorrent). El resto de la imagen queda intacta.
+#
+# El Jackett.Common.dll que se copia aquí es el que genera el workflow
+# .github/workflows/build-jackett-grantorrent.yml a partir del branch
+# grantorrent-indexer (upstream + indexador Grantorrent).
+#
+# El contexto de build debe contener SOLO:
+#   - Dockerfile.grantorrent
+#   - Jackett.Common.dll
+# (el workflow monta un contexto mínimo para que el build sea rápido).
+# =============================================================================
+FROM lscr.io/linuxserver/jackett:latest
+
+# Reemplazar el DLL que contiene los indexadores por el que incluye Grantorrent.
+# La ruta /app/Jackett/ es donde la imagen oficial instala Jackett.
+COPY Jackett.Common.dll /app/Jackett/Jackett.Common.dll
