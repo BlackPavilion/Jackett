@@ -96,6 +96,14 @@ namespace Jackett.Common.Indexers.Definitions
         {
             query = SanitizeTorznabQuery(query);
 
+            // the site has no category filter, so the TV/movie kind of each release is
+            // inferred. When the caller requests a specific kind of categories (Sonarr ->
+            // tvmovie=, Radarr -> movie=) that request is the most reliable signal: a TV
+            // search must yield TV releases even when the title has no SxxEyy/"Cap."/
+            // "Temporada" marker (otherwise Sonarr filters every result out and reports
+            // "no results in the configured categories").
+            var forceTv = GetForcedTv(query);
+
             // without a search term the site returns the latest releases (home page)
             var searchUrl = query.SearchTerm.IsNullOrWhiteSpace()
                 ? SiteLink
@@ -121,7 +129,7 @@ namespace Jackett.Common.Indexers.Definitions
                     // are only available in the detail page options table, so the detail
                     // page is fetched per card and one release is emitted per download
                     // option (accepted Jackett pattern: MejorTorrent, DonTorrent, AniDUB).
-                    var detailReleases = await ParseDetailReleases(cardInfo, query);
+                    var detailReleases = await ParseDetailReleases(cardInfo, query, forceTv);
                     releases.AddRange(detailReleases);
                 }
 
@@ -171,7 +179,7 @@ namespace Jackett.Common.Indexers.Definitions
         /// (row of the options table). Rows without a data-src attribute are skipped
         /// (they are not downloadable).
         /// </summary>
-        private async Task<List<ReleaseInfo>> ParseDetailReleases(CardInfo card, TorznabQuery query)
+        private async Task<List<ReleaseInfo>> ParseDetailReleases(CardInfo card, TorznabQuery query, bool? forceTv)
         {
             var detailPage = await RequestWithCookiesAndRetryAsync(card.Details.AbsoluteUri, referer: SiteLink);
             if (detailPage.Status != HttpStatusCode.OK)
@@ -197,7 +205,7 @@ namespace Jackett.Common.Indexers.Definitions
             var rows = dom.QuerySelectorAll("tr[wire\\:key]");
             for (var i = 0; i < rows.Length; i++)
             {
-                var release = ParseOptionRow(card, rows[i], i, year);
+                var release = ParseOptionRow(card, rows[i], i, year, forceTv);
                 if (release != null)
                     releases.Add(release);
             }
@@ -209,7 +217,7 @@ namespace Jackett.Common.Indexers.Definitions
         /// Parses a single row of the options table into a release. Returns null when the
         /// row has no data-src attribute (not downloadable) or too few cells.
         /// </summary>
-        private ReleaseInfo ParseOptionRow(CardInfo card, IElement row, int optionIndex, int? year)
+        private ReleaseInfo ParseOptionRow(CardInfo card, IElement row, int optionIndex, int? year, bool? forceTv)
         {
             var downloadButton = row.QuerySelector("a.linktorrent");
             var dataSrc = downloadButton?.GetAttribute("data-src");
@@ -255,7 +263,7 @@ namespace Jackett.Common.Indexers.Definitions
                 Details = card.Details,
                 Link = link,
                 Guid = link,
-                Category = MapTrackerCatToNewznab(ParseCategory(card.Title, quality)),
+                Category = MapTrackerCatToNewznab(ParseCategory(card.Title, quality, forceTv)),
                 PublishDate = card.PublishDate ?? DateTime.Now,
                 Size = size,
                 Seeders = 1,
@@ -663,14 +671,32 @@ namespace Jackett.Common.Indexers.Definitions
             return query;
         }
 
-        private static string ParseCategory(string title, string quality)
+        // Returns the TV/movie kind requested by the query, or null when the query does
+        // not disambiguate (general search, or both kinds requested). Torznab standard:
+        // TV categories are 5000-5999, movie categories 2000-2999.
+        private static bool? GetForcedTv(TorznabQuery query)
+        {
+            if (query?.Categories == null || query.Categories.Length == 0)
+                return null;
+            var hasTv = query.Categories.Any(c => c >= 5000 && c < 6000);
+            var hasMovie = query.Categories.Any(c => c >= 2000 && c < 3000);
+            if (hasTv && !hasMovie)
+                return true;
+            if (hasMovie && !hasTv)
+                return false;
+            return null;
+        }
+
+        private static string ParseCategory(string title, string quality, bool? forceTv)
         {
             // the site does not expose a reliable content category in the URL (A1 H7):
             // the 18 sidebar categories are genres, not Torznab categories.
-            // TV/movie heuristic: SxxEyy / "Cap." / "Temporada" in the title.
-            var isTvShow = Regex.IsMatch(title, @"S\d{1,2}E\d{1,3}")
+            // When the caller requested a specific kind of categories (forceTv != null)
+            // that is the authoritative signal; otherwise fall back to the title
+            // heuristic: SxxEyy / "Cap." / "Temporada" in the title.
+            var isTvShow = forceTv ?? (Regex.IsMatch(title, @"S\d{1,2}E\d{1,3}")
                            || Regex.IsMatch(title, @"Cap\.?\s*\d+", RegexOptions.IgnoreCase)
-                           || title.IndexOf("Temporada", StringComparison.OrdinalIgnoreCase) >= 0;
+                           || title.IndexOf("Temporada", StringComparison.OrdinalIgnoreCase) >= 0);
 
             var q = (quality ?? "").ToLowerInvariant();
             var tier =

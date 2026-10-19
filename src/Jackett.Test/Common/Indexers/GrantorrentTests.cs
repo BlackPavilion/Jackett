@@ -91,6 +91,37 @@ namespace Jackett.Test.Common.Indexers
         }
 
         [Test]
+        public async Task TestPerformQueryTvCategoriesForceTvAsync()
+        {
+            // Same search/detail pages as TestPerformQuerySearchAsync, but the query requests
+            // TV categories (tvmovie=). "Buscando a Dory" has no SxxEyy/"Cap."/Temporada marker
+            // in the title, so the title heuristic would classify it as a movie; the TV category
+            // request must force the TV kind instead (otherwise Sonarr filters every result out
+            // and reports "no results in the configured categories").
+            var webClient = new TestWebClient();
+            webClient.RegisterRequestCallback("https://grantorrent.foo/?s=dory", "grantorrent-search-multi.html");
+            webClient.RegisterRequestCallback("https://grantorrent.foo/buscando-a-dory/", "grantorrent-detail-dory.html");
+            webClient.RegisterRequestCallback("https://grantorrent.foo/operacion-dragon/", "grantorrent-detail.html");
+            var indexer = NewIndexer(webClient);
+
+            var result = await indexer.ResultsForQuery(
+                new TorznabQuery { QueryType = "search", SearchTerm = "dory", Categories = new[] { 5000, 5030, 5040, 5045 } }, false);
+            var releases = result.Releases.ToList();
+
+            releases.Should().HaveCount(5);
+
+            // DVDRip (SD) => TV/SD (5030), not Movies/SD (2030)
+            var hdrip = releases.Single(r => r.Title == "Buscando a Dory (2016) DVDRip SPANISH");
+            hdrip.Category.Should().Contain(TorznabCatType.TVSD.ID);
+            hdrip.Category.Should().NotContain(TorznabCatType.MoviesSD.ID);
+
+            // MicroHD-1080p (HD) => TV/HD (5040), not Movies/HD (2040)
+            var microhd = releases.Single(r => r.Title == "Buscando a Dory (2016) MicroHD-1080p SPANISH");
+            microhd.Category.Should().Contain(TorznabCatType.TVHD.ID);
+            microhd.Category.Should().NotContain(TorznabCatType.MoviesHD.ID);
+        }
+
+        [Test]
         public async Task TestDownloadAsync()
         {
             _webClient.RegisterRequestCallback("https://grantorrent.foo/operacion-dragon/", "grantorrent-detail.html");
