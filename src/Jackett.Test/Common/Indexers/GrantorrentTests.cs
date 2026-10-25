@@ -173,6 +173,54 @@ namespace Jackett.Test.Common.Indexers
         }
 
         [Test]
+        public async Task TestPerformQuerySeriesSeasonPageAsync()
+        {
+            // The per-season pages (/series/<show>-temporada-N/) use a different table:
+            // the "Peso" column carries the QUALITY (not the size) and the last episode
+            // cell ends with a word ("1x06 Final"). Both must be handled: normalized
+            // episode, quality in the title and a size estimated from the quality.
+            var webClient = new TestWebClient();
+            webClient.RegisterRequestCallback("https://grantorrent.foo/?s=peaky&filtro=series", "grantorrent-search-series-season.html");
+            webClient.RegisterRequestCallback("https://grantorrent.foo/series/peaky-blinders-temporada-1/", "grantorrent-detail-series-season.html");
+            var indexer = NewIndexer(webClient);
+
+            var result = await indexer.ResultsForQuery(
+                new TorznabQuery { QueryType = "tvsearch", SearchTerm = "peaky S01", Categories = new[] { 5000 } }, false);
+            var releases = result.Releases.ToList();
+
+            releases.Select(r => r.Title).Should().BeEquivalentTo(new[]
+            {
+                "Peaky Blinders S01E01 DVDRip SPANISH",
+                "Peaky Blinders S01E01 720p SPANISH",
+                "Peaky Blinders S01E06 DVDRip SPANISH"
+            });
+            releases.Should().OnlyContain(r => !r.Title.Contains("Temporada"));
+            releases.Should().OnlyContain(r => r.Size > 0);
+        }
+
+        [Test]
+        public async Task TestPerformQueryFiltersByEpisodeAsync()
+        {
+            var webClient = new TestWebClient();
+            webClient.RegisterRequestCallback("https://grantorrent.foo/?s=peaky&filtro=series", "grantorrent-search-series-season.html");
+            webClient.RegisterRequestCallback("https://grantorrent.foo/series/peaky-blinders-temporada-1/", "grantorrent-detail-series-season.html");
+            var indexer = NewIndexer(webClient);
+
+            var result = await indexer.ResultsForQuery(
+                new TorznabQuery
+                {
+                    QueryType = "tvsearch",
+                    SearchTerm = "peaky",
+                    Season = 1,
+                    Episode = "6",
+                    Categories = new[] { 5000 }
+                }, false);
+
+            result.Releases.Should().ContainSingle()
+                .Which.Title.Should().Be("Peaky Blinders S01E06 DVDRip SPANISH");
+        }
+
+        [Test]
         public async Task TestDownloadAsync()
         {
             _webClient.RegisterRequestCallback("https://grantorrent.foo/operacion-dragon/", "grantorrent-detail.html");

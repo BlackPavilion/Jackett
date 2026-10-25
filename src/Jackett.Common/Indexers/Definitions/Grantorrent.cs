@@ -300,10 +300,22 @@ namespace Jackett.Common.Indexers.Definitions
             if (isSeries)
             {
                 // series table: Idioma | Episodios | Peso | Clave | Opcion 1
-                // (no quality column; the episode is in the "Episodios" column)
+                // (no quality column; the episode is in the "Episodios" column).
+                // On the per-season pages (/series/<show>-temporada-N/) the same
+                // "Peso" column carries the QUALITY instead of the size
+                // ("HDRip", "HD 720p", ...), so both layouts are handled.
                 episode = NormalizeEpisode(cells[1]?.TextContent);
-                peso = cells[2]?.TextContent ?? "";
-                quality = null;
+                var third = cells[2]?.TextContent?.Trim() ?? "";
+                if (LooksLikeSize(third))
+                {
+                    peso = third;
+                    quality = null;
+                }
+                else
+                {
+                    peso = "";
+                    quality = MapQuality(GetQuality(null, third));
+                }
             }
             else
             {
@@ -327,8 +339,21 @@ namespace Jackett.Common.Indexers.Definitions
             var title = card.Title;
             if (isSeries)
             {
+                // some posts are a whole season ("Peaky Blinders – Temporada 2").
+                // Sonarr parses "Temporada N" but "S0N" is unambiguous, and when the
+                // row already has the episode the season marker is redundant.
+                var pack = Regex.Match(title, @"(?:temporada|season)\s*(\d{1,2})\b", RegexOptions.IgnoreCase);
+                if (pack.Success)
+                {
+                    title = Regex.Replace(title, @"\s*[-–—:|]?\s*(?:temporada|season)\s*\d{1,2}\b", "", RegexOptions.IgnoreCase).Trim();
+                    if (episode.IsNullOrWhiteSpace() && int.TryParse(pack.Groups[1].Value, out var packSeason))
+                        title += " S" + packSeason.ToString("D2");
+                }
+
                 if (episode.IsNotNullOrWhiteSpace())
                     title += " " + episode;
+                if (quality.IsNotNullOrWhiteSpace())
+                    title += " " + quality;
             }
             else
             {
@@ -520,15 +545,16 @@ namespace Jackett.Common.Indexers.Definitions
             if (episode.IsNullOrWhiteSpace())
                 return null;
 
+            // the episode cell has trailing words on some pages ("1x06 Final")
             var e = episode.Trim();
             // "6x1" -> "S06E01"
-            var match = Regex.Match(e, @"^(\d{1,3})\s*[xX]\s*(\d{1,4})$");
+            var match = Regex.Match(e, @"^(\d{1,3})\s*[xX]\s*(\d{1,4})\b");
             if (match.Success)
                 return "S" + int.Parse(match.Groups[1].Value).ToString("D2")
                        + "E" + int.Parse(match.Groups[2].Value).ToString("D2");
 
             // already "S06E01"
-            match = Regex.Match(e, @"^S(\d{1,3})E(\d{1,4})$", RegexOptions.IgnoreCase);
+            match = Regex.Match(e, @"^S(\d{1,3})\s*E(\d{1,4})\b", RegexOptions.IgnoreCase);
             if (match.Success)
                 return "S" + int.Parse(match.Groups[1].Value).ToString("D2")
                        + "E" + int.Parse(match.Groups[2].Value).ToString("D2");
@@ -641,11 +667,21 @@ namespace Jackett.Common.Indexers.Definitions
 
             if (Regex.IsMatch(q, @"^hdrip$", RegexOptions.IgnoreCase))
                 return "DVDRip";
+            var hd = Regex.Match(q, @"^hd\s*(720p|1080p)$", RegexOptions.IgnoreCase);
+            if (hd.Success)
+                return hd.Groups[1].Value.ToLowerInvariant();
             if (Regex.IsMatch(q, @"^3d$", RegexOptions.IgnoreCase))
                 return "BluRay-1080p 3D";
 
             return q;
         }
+
+        /// <summary>
+        /// True when the "Peso" column really holds a size ("2GB", "1.73 Gb.", "0GB")
+        /// and not a quality token ("HDRip", "HD 720p"), which some series pages use.
+        /// </summary>
+        private static bool LooksLikeSize(string value) =>
+            !value.IsNullOrWhiteSpace() && Regex.IsMatch(value, @"\d\s*(?:GB|MB|KB|B)\b", RegexOptions.IgnoreCase);
 
         /// <summary>
         /// Parses the "Peso" column (e.g. "1.73 Gb.", "19.4 Gb.", "1.80GB.") into bytes.
@@ -834,13 +870,18 @@ namespace Jackett.Common.Indexers.Definitions
             if (query.Season == null || query.Season == 0)
                 return true;
 
-            // the series title carries the normalized episode (SxxEyy)
-            var match = Regex.Match(release.Title ?? "", @"S(\d{1,2})E(\d{1,3})", RegexOptions.IgnoreCase);
+            // the title carries the normalized episode ("S01E02") or, for a whole
+            // season, just the season ("S01") after the "Temporada N" normalization.
+            var match = Regex.Match(release.Title ?? "", @"S(\d{1,2})(?:E(\d{1,3}))?", RegexOptions.IgnoreCase);
             if (!match.Success)
-                return true; // season packs / unparseable titles are left to Sonarr
+                return true; // unparseable titles are left to Sonarr
 
             if (!int.TryParse(match.Groups[1].Value, out var releaseSeason) || releaseSeason != query.Season.Value)
                 return false;
+
+            // a season pack ("S01") is valid for any episode of that season
+            if (!match.Groups[2].Success)
+                return true;
 
             if (query.Episode.IsNotNullOrWhiteSpace()
                 && int.TryParse(query.Episode, out var requestedEpisode)
