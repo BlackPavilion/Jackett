@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
@@ -59,7 +60,13 @@ namespace Jackett.Common.Indexers.Definitions
             {
                 TvSearchParams = new List<TvSearchParam>
                 {
-                    TvSearchParam.Q
+                    TvSearchParam.Q,
+                    // Sonarr only queries an indexer for SEASON searches when the
+                    // tv-search caps advertise the "season" parameter (and for
+                    // episode searches it needs "ep"). Without them Sonarr silently
+                    // skips this indexer for TV, which looks like "no results".
+                    TvSearchParam.Season,
+                    TvSearchParam.Ep
                 },
                 MovieSearchParams = new List<MovieSearchParam>
                 {
@@ -141,7 +148,7 @@ namespace Jackett.Common.Indexers.Definitions
                         await semaphore.WaitAsync();
                         try
                         {
-                            return await ParseDetailReleases(card, query, forceTv);
+                            return await GetDetailReleasesAsync(card, query, forceTv);
                         }
                         finally
                         {
@@ -228,6 +235,38 @@ namespace Jackett.Common.Indexers.Definitions
             return new CardInfo(title, details, publishDate, poster, quality);
         }
 
+        private sealed record CachedReleases(DateTime ExpiresUtc, List<ReleaseInfo> Releases);
+
+        // Detail pages are heavy (the main series page is ~8 MB) and the site is
+        // usually reached through a slow proxy: a Sonarr season search issues one
+        // query per season and all of them hit the SAME detail pages. Caching the
+        // parsed rows avoids repeating those downloads, so the first query pays the
+        // cost and the rest are instant (and stay well under the indexer timeout).
+        private static readonly ConcurrentDictionary<string, CachedReleases> DetailReleasesCache =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static readonly TimeSpan DetailReleasesCacheTtl = TimeSpan.FromMinutes(10);
+        private const int DetailReleasesCacheMaxEntries = 60;
+
+        /// <summary>
+        /// Returns the releases of a detail page, from the cache when it was fetched
+        /// recently. The season/episode filtering is applied by the caller, so the
+        /// cached list is query independent (only the year and the kind matter).
+        /// </summary>
+        private async Task<List<ReleaseInfo>> GetDetailReleasesAsync(CardInfo card, TorznabQuery query, bool? forceTv)
+        {
+            var key = $"{card.Details.AbsoluteUri}|{query.Year ?? 0}|{forceTv}";
+            if (DetailReleasesCache.TryGetValue(key, out var cached) && cached.ExpiresUtc > DateTime.UtcNow)
+                return cached.Releases;
+
+            var releases = await ParseDetailReleases(card, query, forceTv);
+
+            if (DetailReleasesCache.Count >= DetailReleasesCacheMaxEntries)
+                DetailReleasesCache.Clear();
+            DetailReleasesCache[key] = new CachedReleases(DateTime.UtcNow.Add(DetailReleasesCacheTtl), releases);
+
+            return releases;
+        }
+
         /// <summary>
         /// Fetches the detail page of a card and emits one release per download option
         /// (row of the options table). Rows without a data-src attribute are skipped
@@ -274,7 +313,12 @@ namespace Jackett.Common.Indexers.Definitions
                     releases.Add(release);
             }
 
-            return releases;
+            // the huge series pages repeat the same row thousands of times; dedupe
+            // here as well so the cached list stays small
+            return releases
+                .GroupBy(r => r.Title + "|" + r.Size + "|" + r.Details, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First())
+                .ToList();
         }
 
         /// <summary>

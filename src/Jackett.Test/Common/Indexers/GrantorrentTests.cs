@@ -199,6 +199,17 @@ namespace Jackett.Test.Common.Indexers
         }
 
         [Test]
+        public void TestCapsSupportSeasonAndEpisodeSearches()
+        {
+            // Sonarr only queries an indexer for SEASON searches when its tv-search
+            // caps advertise the "season" parameter (and "ep" for episode searches);
+            // without them the indexer is silently skipped for TV.
+            var caps = NewIndexer(new TestWebClient()).TorznabCaps;
+
+            caps.TvSearchParams.Should().Contain(new[] { TvSearchParam.Q, TvSearchParam.Season, TvSearchParam.Ep });
+        }
+
+        [Test]
         public async Task TestPerformQueryFiltersByEpisodeAsync()
         {
             var webClient = new TestWebClient();
