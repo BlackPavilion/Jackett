@@ -1,117 +1,223 @@
 # =============================================================================
 # Pipeline: Jackett oficial + indexador Grantorrent (imagen parcheada)
 #
-# Qué hace:
-#   1. Mergea upstream (Jackett/Jackett:master) en el branch grantorrent-indexer
-#      (que contiene el indexador Grantorrent). Así el branch siempre = última
-#      upstream + indexador.
-#   2. Compila Jackett.Common.dll (el único binario que contiene el indexador).
-#   3. Construye una imagen "parcheada": FROM lscr.io/linuxserver/jackett:latest
-#      + reemplazo de Jackett.Common.dll (ver Dockerfile.grantorrent).
-#   4. La pusha a GHCR (ghcr.io/blackpavilion/jackett-grantorrent).
+# - Trigger: push a grantorrent-indexer (cambios propios), schedule cada 6 h
+#   y workflow_dispatch manual (input "force").
+# - Job "check": compara
+#     * commit de upstream (Jackett/Jackett master),
+#     * digest de la imagen base (lscr.io/linuxserver/jackett:latest),
+#     * hash de nuestros ficheros (indexador, Dockerfile, workflow),
+#   y SOLO construye si algo cambió (o si se fuerza manualmente).
+# - Job "build": mergea upstream/master en grantorrent-indexer, compila
+#   Jackett.Common.dll con la versión exacta de la imagen base y publica
+#   ghcr.io/blackpavilion/jackett-grantorrent:latest + :<commit>.
+# - Tras un build correcto guarda el estado en
+#   .github/grantorrent-build-state.json (commit en la misma rama).
 #
-# En el NAS, el contenedor de Jackett usa esta imagen (tag :latest) y se
-# actualiza automáticamente (Watchtower tira la nueva :latest de GHCR).
-#
-# Seguridad: si el merge o el build fallan, el workflow falla y la imagen
-# anterior sigue en producción (no se rompe nada).
-#
-# Trigger:
-#   - schedule: diario a las 03:00 UTC (antes de las 04:00 de Watchtower).
-#   - workflow_dispatch: manual (para probar o forzar una actualización).
+# IMPORTANTE: GitHub ejecuta los workflows programados con la versión del
+# fichero que está en la RAMA POR DEFECTO del repo. Si la rama por defecto es
+# "master", este fichero debe existir también allí (o cambiar la rama por
+# defecto a grantorrent-indexer en Settings -> Branches).
 # =============================================================================
 name: Build Jackett Grantorrent
 
 on:
   schedule:
-    # Diario a las 03:00 UTC (1:00 AM en Madrid en invierno / 2:00 en verano).
-    # Antes de que Watchtower (04:00) tire la imagen nueva.
-    - cron: '0 3 * * *'
-  workflow_dispatch: {}
+    # Cada 6 horas. El "check" es barato; solo se construye si hay cambios.
+    - cron: '0 */6 * * *'
+  # Al subir cambios propios (indexador, Dockerfile, workflow) se construye al
+  # momento. El commit de estado que escribe el propio workflow no está en
+  # "paths", así que no se re-dispara a sí mismo.
+  push:
+    branches: [grantorrent-indexer]
+    paths:
+      - 'src/Jackett.Common/Indexers/Definitions/Grantorrent.cs'
+      - 'Dockerfile.grantorrent'
+      - '.github/workflows/build-jackett-grantorrent.yml'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Forzar build aunque no haya cambios'
+        type: boolean
+        default: false
 
-# Permisos mínimos:
-#   contents: write -> para push del merge commit al branch.
-#   packages: write -> para push de la imagen a GHCR.
 permissions:
   contents: write
   packages: write
 
+# Evita que dos ejecuciones (schedule + manual) mergeen/pusheen a la vez.
+concurrency:
+  group: build-jackett-grantorrent
+  cancel-in-progress: false
+
+env:
+  BRANCH: grantorrent-indexer
+  BASE_REPO: lscr.io/linuxserver/jackett
+  BASE_IMAGE: lscr.io/linuxserver/jackett:latest
+  UPSTREAM_REPO: https://github.com/Jackett/Jackett.git
+  STATE_FILE: .github/grantorrent-build-state.json
+
 jobs:
-  build-and-push:
+  # ---------------------------------------------------------------------------
+  # 1. Decidir si hay que construir.
+  # ---------------------------------------------------------------------------
+  check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      reason: ${{ steps.decide.outputs.reason }}
+      upstream_sha: ${{ steps.decide.outputs.upstream_sha }}
+      base_digest: ${{ steps.base.outputs.digest }}
     steps:
-      # ------------------------------------------------------------------
-      # 1. Checkout del branch (historial completo para poder mergear).
-      # ------------------------------------------------------------------
-      - name: Checkout grantorrent-indexer
+      - name: Checkout ${{ env.BRANCH }}
         uses: actions/checkout@v4
         with:
-          ref: grantorrent-indexer
+          ref: ${{ env.BRANCH }}
           fetch-depth: 0
 
-      # ------------------------------------------------------------------
-      # 2. Merge de upstream/master en el branch.
-      #    Si hay conflicto, el merge falla y el workflow se detiene
-      #    (la imagen anterior sigue en producción).
-      # ------------------------------------------------------------------
-      - name: Merge upstream/master
-        id: merge
+      - name: Fetch upstream
         run: |
           set -euo pipefail
-          git remote add upstream https://github.com/Jackett/Jackett.git
-          git fetch upstream --tags
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream master --quiet
+
+      - name: Read previous state
+        id: state
+        run: |
+          set -euo pipefail
+          python3 -c 'import json,os,sys; p=sys.argv[1]; s=json.load(open(p)) if os.path.exists(p) else {}; keys=(("upstream_commit","upstream_commit"),("base_digest","base_image_digest"),("source_hash","source_hash")); open(sys.argv[2],"a").write("".join("%s=%s\n" % (out, s.get(src, "")) for out, src in keys))' "$STATE_FILE" "$GITHUB_OUTPUT"
+
+      - name: Compute source hash
+        id: source
+        run: |
+          set -euo pipefail
+          HASH=$(git hash-object \
+            src/Jackett.Common/Indexers/Definitions/Grantorrent.cs \
+            Dockerfile.grantorrent \
+            .github/workflows/build-jackett-grantorrent.yml \
+            | git hash-object --stdin)
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Get base image digest
+        id: base
+        run: |
+          set -euo pipefail
+          DIGEST=""
+          for i in 1 2 3; do
+            if DIGEST=$(docker buildx imagetools inspect "$BASE_IMAGE" \
+                 --format '{{json .Manifest.Digest}}' | tr -d '"'); then
+              break
+            fi
+            echo ">> Reintento $i leyendo el digest de $BASE_IMAGE"
+            sleep 5
+          done
+          if [ -z "$DIGEST" ]; then
+            echo "ERROR: no se pudo leer el digest de $BASE_IMAGE"
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+          PREV_UPSTREAM: ${{ steps.state.outputs.upstream_commit }}
+          PREV_DIGEST: ${{ steps.state.outputs.base_digest }}
+          PREV_SOURCE: ${{ steps.state.outputs.source_hash }}
+          NEW_DIGEST: ${{ steps.base.outputs.digest }}
+          NEW_SOURCE: ${{ steps.source.outputs.hash }}
+        run: |
+          set -euo pipefail
+          UPSTREAM=$(git rev-parse upstream/master)
+          REASON=""
+          if [ "${FORCE:-}" = "true" ]; then
+            REASON="forzado manualmente"
+          elif [ -z "$PREV_UPSTREAM" ]; then
+            REASON="primera ejecución (sin estado)"
+          elif [ "$UPSTREAM" != "$PREV_UPSTREAM" ]; then
+            REASON="upstream Jackett cambió"
+          elif [ "$NEW_DIGEST" != "$PREV_DIGEST" ]; then
+            REASON="imagen base cambió"
+          elif [ "$NEW_SOURCE" != "$PREV_SOURCE" ]; then
+            REASON="código del indexador/Dockerfile/workflow cambió"
+          fi
+          if [ -n "$REASON" ]; then BUILD="true"; else BUILD="false"; fi
+
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Build Jackett Grantorrent"
+            echo "- build: **$BUILD**"
+            echo "- motivo: ${REASON:-sin cambios}"
+            echo "- upstream: \`$UPSTREAM\`"
+            echo "- base digest: \`$NEW_DIGEST\`"
+            echo "- source hash: \`$NEW_SOURCE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 2. Mergear upstream, compilar y publicar la imagen.
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout ${{ env.BRANCH }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+
+      - name: Merge upstream/master
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream master
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # ¿Ya está actualizado? (evita merge commits innecesarios)
           LOCAL=$(git rev-parse HEAD)
           UPSTREAM=$(git rev-parse upstream/master)
           MERGE_BASE=$(git merge-base HEAD upstream/master)
 
           if [ "$LOCAL" = "$UPSTREAM" ] || [ "$MERGE_BASE" = "$UPSTREAM" ]; then
             echo ">> El branch ya está al día con upstream/master. Sin merge."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
           else
-            echo ">> Mergeando upstream/master en grantorrent-indexer..."
+            echo ">> Mergeando upstream/master en $BRANCH..."
             git merge upstream/master --no-edit
-            git push origin HEAD:grantorrent-indexer
-            echo ">> Merge pushado al branch."
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+
+            # Concurrency ya serializa las ejecuciones; este reintento cubre una
+            # carrera puntual (p. ej. un push manual durante el run).
+            if ! git push origin HEAD:"$BRANCH"; then
+              echo ">> Push rechazado; integrando el remoto y reintentando..."
+              git fetch origin "$BRANCH"
+              git merge origin/"$BRANCH" --no-edit
+              git push origin HEAD:"$BRANCH"
+            fi
+            echo ">> Merge pushado."
           fi
 
-      # ------------------------------------------------------------------
-      # 3. Setup de .NET 9.0 (la versión que usa Jackett y la imagen oficial).
-      # ------------------------------------------------------------------
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '9.0.x'
 
-      # ------------------------------------------------------------------
-      # 4. Leer la versión de Jackett.Common de la imagen base oficial.
-      #    CRÍTICO: el DLL parcheado debe compilar con la MISMA versión que
-      #    la imagen base, porque jackett.dll (de la imagen base) referencia
-      #    Jackett.Common con esa versión. Si el DLL tiene otra versión
-      #    (p. ej. 0.0.0.0), CoreCLR rechaza la carga en el check de
-      #    compatibilidad de versiones (found < requested) y el contenedor
-      #    entra en bootloop con FileNotFoundException.
-      # ------------------------------------------------------------------
       - name: Get base image Jackett.Common version
         id: basever
         run: |
           set -euo pipefail
-          docker pull lscr.io/linuxserver/jackett:latest
-          docker create --name jver lscr.io/linuxserver/jackett:latest
+          # Se usa el digest decidido en "check" para que la imagen base sea
+          # exactamente la misma que se registró en el estado (reproducible).
+          BASE_REF="${BASE_REPO}@${{ needs.check.outputs.base_digest }}"
+          docker pull "$BASE_REF"
+          docker create --name jver "$BASE_REF"
           docker cp jver:/app/Jackett/jackett.deps.json /tmp/jackett.deps.json
           docker rm jver
-          VER=$(python3 -c "
-          import json
-          d = json.load(open('/tmp/jackett.deps.json'))
-          for name in d.get('libraries', {}):
-              if name.startswith('Jackett.Common/'):
-                  print(name.split('/')[1])
-                  break
-          ")
+          VER=$(python3 -c "import json; d=json.load(open('/tmp/jackett.deps.json')); print(next((n.split('/')[1] for n in d.get('libraries', {}) if n.startswith('Jackett.Common/')), ''))")
           if [ -z "$VER" ]; then
             echo "ERROR: no se pudo leer la versión de Jackett.Common de la imagen base"
             exit 1
@@ -119,57 +225,42 @@ jobs:
           echo ">> Versión de Jackett.Common en la imagen base: $VER"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------------
-      # 5. Compilar Jackett.Common.dll (con el indexador Grantorrent).
-      #    Solo se compila Jackett.Common (el proyecto que contiene el
-      #    indexador); sus dependencias se resuelven automáticamente.
-      #    Se compila con la versión de la imagen base (ver paso anterior).
-      # ------------------------------------------------------------------
       - name: Build Jackett.Common.dll
         run: |
           set -euo pipefail
           # /p:Version=... es OBLIGATORIO: sin él el DLL sale con 0.0.0.0
-          # (por src/Directory.Build.props) y CoreCLR no lo carga.
+          # (src/Directory.Build.props) y CoreCLR no lo carga (bootloop).
           dotnet build src/Jackett.Common/Jackett.Common.csproj -c Release -f net9.0 \
             /p:Version=${{ steps.basever.outputs.version }} \
             /p:AssemblyVersion=${{ steps.basever.outputs.version }} \
             /p:FileVersion=${{ steps.basever.outputs.version }} \
             /p:InformationalVersion=${{ steps.basever.outputs.version }}
-          # Copiar el DLL a la raíz para el contexto de build de Docker.
           cp src/Jackett.Common/bin/Release/net9.0/Jackett.Common.dll ./Jackett.Common.dll
           echo ">> Jackett.Common.dll generado (versión ${{ steps.basever.outputs.version }}):"
           ls -la ./Jackett.Common.dll
 
-      # ------------------------------------------------------------------
-      # 6. Login a GHCR (con el GITHUB_TOKEN, que tiene packages: write).
-      # ------------------------------------------------------------------
       - name: Login to GHCR
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
             -u "${{ github.actor }}" --password-stdin
 
-      # ------------------------------------------------------------------
-      # 6. Construir la imagen parcheada y push a GHCR.
-      #    Contexto mínimo (solo Dockerfile + DLL) para un build rápido.
-      # ------------------------------------------------------------------
       - name: Build and push image
         run: |
           set -euo pipefail
-          # Contexto mínimo para el build de Docker.
           BUILD_CTX=$(mktemp -d)
           cp Dockerfile.grantorrent "$BUILD_CTX/Dockerfile"
           cp Jackett.Common.dll "$BUILD_CTX/Jackett.Common.dll"
 
-          # Tags: :latest (para auto-update) + tag por commit (versionado).
-          # El nombre del repo en GHCR debe ser minúsculas (Docker lo exige);
-          # github.repository_owner puede traer mayúsculas (p. ej. BlackPavilion).
           COMMIT=$(git rev-parse --short HEAD)
           OWNER="${{ github.repository_owner }}"
           REPO="ghcr.io/${OWNER,,}/jackett-grantorrent"
-          echo ">> Imagen base: lscr.io/linuxserver/jackett:latest"
+          BASE_REF="${BASE_REPO}@${{ needs.check.outputs.base_digest }}"
+
+          echo ">> Imagen base: $BASE_REF"
           echo ">> Tags: ${REPO}:latest y ${REPO}:${COMMIT}"
 
           docker build -f "$BUILD_CTX/Dockerfile" \
+            --build-arg BASE_IMAGE="$BASE_REF" \
             -t "${REPO}:latest" \
             -t "${REPO}:${COMMIT}" \
             "$BUILD_CTX"
@@ -177,3 +268,30 @@ jobs:
           docker push "${REPO}:latest"
           docker push "${REPO}:${COMMIT}"
           echo ">> Imagen pushada a GHCR: ${REPO}:latest (${COMMIT})"
+
+      # -------------------------------------------------------------------
+      # 3. Guardar el estado SOLO tras un build correcto. Si algo falla
+      #    antes, el estado no cambia y el siguiente run reintenta.
+      # -------------------------------------------------------------------
+      - name: Record build state
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          UPSTREAM=$(git rev-parse upstream/master)
+          SOURCE_HASH=$(git hash-object \
+            src/Jackett.Common/Indexers/Definitions/Grantorrent.cs \
+            Dockerfile.grantorrent \
+            .github/workflows/build-jackett-grantorrent.yml \
+            | git hash-object --stdin)
+
+          python3 -c 'import json,sys; p,u,d,s=sys.argv[1:5]; f=open(p,"w"); json.dump({"upstream_commit":u,"base_image_digest":d,"source_hash":s}, f, indent=2); f.write("\n"); f.close()' "$STATE_FILE" "$UPSTREAM" "${{ needs.check.outputs.base_digest }}" "$SOURCE_HASH"
+
+          git add "$STATE_FILE"
+          if git diff --cached --quiet; then
+            echo ">> Estado sin cambios."
+          else
+            git commit -m "ci: record build state [skip ci]"
+            git push origin HEAD:"$BRANCH"
+          fi

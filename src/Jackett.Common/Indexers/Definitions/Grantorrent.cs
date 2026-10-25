@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using AngleSharp.Dom;
 using AngleSharp.Html.Parser;
@@ -108,6 +109,7 @@ namespace Jackett.Common.Indexers.Definitions
             var forceTv = GetForcedTv(query);
 
             var releases = new List<ReleaseInfo>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var searchUrl in BuildSearchUrls(query, forceTv))
             {
                 var result = await RequestWithCookiesAndRetryAsync(searchUrl, referer: SiteLink);
@@ -119,19 +121,45 @@ namespace Jackett.Common.Indexers.Definitions
                     var parser = new HtmlParser();
                     using var dom = parser.ParseDocument(result.ContentString);
 
-                    foreach (var card in dom.QuerySelectorAll("div[x-data*='showDetail']"))
+                    var cards = dom.QuerySelectorAll("div[x-data*='showDetail']")
+                        .Select(ParseCard)
+                        .Where(c => c != null)
+                        .Select(c => c!)
+                        .ToList();
+
+                    // the search page only has the title; the quality/size/language
+                    // (movies) or the episode (series) are only available in the
+                    // detail page options table, so the detail page is fetched per
+                    // card and one release is emitted per download option (accepted
+                    // Jackett pattern: MejorTorrent, DonTorrent, AniDUB).
+                    // Detail pages are independent, so fetch a few in parallel: the
+                    // series pages are huge and doing it sequentially can exceed
+                    // Sonarr's indexer timeout (100s).
+                    using var semaphore = new SemaphoreSlim(4);
+                    var detailTasks = cards.Select(async card =>
                     {
-                        var cardInfo = ParseCard(card);
-                        if (cardInfo == null)
+                        await semaphore.WaitAsync();
+                        try
+                        {
+                            return await ParseDetailReleases(card, query, forceTv);
+                        }
+                        finally
+                        {
+                            semaphore.Release();
+                        }
+                    });
+                    var detailResults = await Task.WhenAll(detailTasks);
+
+                    foreach (var release in detailResults.SelectMany(r => r))
+                    {
+                        if (!MatchesRequestedSeason(release, query))
                             continue;
 
-                        // the search page only has the title; the quality/size/language
-                        // (movies) or the episode (series) are only available in the
-                        // detail page options table, so the detail page is fetched per
-                        // card and one release is emitted per download option (accepted
-                        // Jackett pattern: MejorTorrent, DonTorrent, AniDUB).
-                        var detailReleases = await ParseDetailReleases(cardInfo, query, forceTv);
-                        releases.AddRange(detailReleases);
+                        // series detail pages repeat the same rows hundreds of times;
+                        // deduplicate so the XML stays small and Sonarr is not flooded
+                        var key = $"{release.Title}|{release.Size}|{release.Details}";
+                        if (seen.Add(key))
+                            releases.Add(release);
                     }
                 }
                 catch (Exception ex)
@@ -768,12 +796,59 @@ namespace Jackett.Common.Indexers.Definitions
                 searchTerm = searchTerm.Replace(m.Groups[1].Value, "");
             }
 
+            // Sonarr includes the season/episode in the term in some search modes
+            // ("Peaky Blinders S06" / "Peaky Blinders 6x1"). The site's WordPress search
+            // returns no results with that suffix, so it must be stripped. The parsed
+            // values are kept on the query and used to filter the rows afterwards.
+            var seasonEpisode = Regex.Match(
+                searchTerm,
+                @"\s+(?:S(\d{1,2})(?:E(\d{1,3}))?|(\d{1,2})x(\d{1,3})|(?:temporada|season)\s*(\d{1,2}))\s*$",
+                RegexOptions.IgnoreCase);
+            if (seasonEpisode.Success)
+            {
+                var season = seasonEpisode.Groups[1].Success ? seasonEpisode.Groups[1].Value
+                    : seasonEpisode.Groups[3].Success ? seasonEpisode.Groups[3].Value
+                    : seasonEpisode.Groups[5].Value;
+                var episode = seasonEpisode.Groups[2].Success ? seasonEpisode.Groups[2].Value
+                    : seasonEpisode.Groups[4].Success ? seasonEpisode.Groups[4].Value
+                    : null;
+
+                if ((query.Season == null || query.Season == 0) && int.TryParse(season, out var parsedSeason))
+                    query.Season = parsedSeason;
+                if (query.Episode.IsNullOrWhiteSpace() && episode.IsNotNullOrWhiteSpace())
+                    query.Episode = episode;
+
+                searchTerm = searchTerm[..seasonEpisode.Index].Trim();
+            }
+
             // remove some words
             searchTerm = Regex.Replace(searchTerm, @"\b(espa[ñn]ol|spanish|castellano|spa)\b", "", RegexOptions.IgnoreCase);
             searchTerm = Regex.Replace(searchTerm, @"\s{2,}", " ").Trim();
 
             query.SearchTerm = searchTerm;
             return query;
+        }
+
+        private static bool MatchesRequestedSeason(ReleaseInfo release, TorznabQuery query)
+        {
+            if (query.Season == null || query.Season == 0)
+                return true;
+
+            // the series title carries the normalized episode (SxxEyy)
+            var match = Regex.Match(release.Title ?? "", @"S(\d{1,2})E(\d{1,3})", RegexOptions.IgnoreCase);
+            if (!match.Success)
+                return true; // season packs / unparseable titles are left to Sonarr
+
+            if (!int.TryParse(match.Groups[1].Value, out var releaseSeason) || releaseSeason != query.Season.Value)
+                return false;
+
+            if (query.Episode.IsNotNullOrWhiteSpace()
+                && int.TryParse(query.Episode, out var requestedEpisode)
+                && int.TryParse(match.Groups[2].Value, out var releaseEpisode)
+                && requestedEpisode != releaseEpisode)
+                return false;
+
+            return true;
         }
 
         // Returns the TV/movie kind requested by the query, or null when the query does

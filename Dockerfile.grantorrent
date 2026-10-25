@@ -17,8 +17,11 @@
 #   - Dockerfile.grantorrent
 #   - Jackett.Common.dll
 # (el workflow monta un contexto mínimo para que el build sea rápido).
+# La imagen base se pasa por digest (--build-arg BASE_IMAGE=...@sha256:...)
+# para que el build sea reproducible y coincida con la versión registrada.
 # =============================================================================
-FROM lscr.io/linuxserver/jackett:latest
+ARG BASE_IMAGE=lscr.io/linuxserver/jackett:latest
+FROM ${BASE_IMAGE}
 
 # Reemplazar el DLL que contiene los indexadores por el que incluye Grantorrent.
 # La ruta /app/Jackett/ es donde la imagen oficial instala Jackett.

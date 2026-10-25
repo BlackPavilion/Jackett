@@ -136,6 +136,43 @@ namespace Jackett.Test.Common.Indexers
         }
 
         [Test]
+        public async Task TestPerformQueryStripsSeasonFromSearchTermAsync()
+        {
+            // Sonarr can include the season in the term ("peaky S01"). The site's search
+            // returns nothing with that suffix, so the indexer must strip it and use it
+            // only to filter the rows.
+            var webClient = new TestWebClient();
+            webClient.RegisterRequestCallback("https://grantorrent.foo/?s=peaky&filtro=series", "grantorrent-search-series.html");
+            webClient.RegisterRequestCallback("https://grantorrent.foo/series/peaky-blinders/", "grantorrent-detail-series.html");
+            webClient.RegisterRequestCallback("https://grantorrent.foo/series/the-pitt/", "grantorrent-detail-series.html");
+            var indexer = NewIndexer(webClient);
+
+            var result = await indexer.ResultsForQuery(
+                new TorznabQuery { QueryType = "tvsearch", SearchTerm = "peaky S01", Categories = new[] { 5000 } }, false);
+            var releases = result.Releases.ToList();
+
+            // 2 cards x 2 downloadable rows, all S01 in the fixture
+            releases.Should().HaveCount(4);
+            releases.Should().OnlyContain(r => r.Title.Contains("S01E"));
+        }
+
+        [Test]
+        public async Task TestPerformQueryFiltersBySeasonAsync()
+        {
+            var webClient = new TestWebClient();
+            webClient.RegisterRequestCallback("https://grantorrent.foo/?s=peaky&filtro=series", "grantorrent-search-series.html");
+            webClient.RegisterRequestCallback("https://grantorrent.foo/series/peaky-blinders/", "grantorrent-detail-series.html");
+            webClient.RegisterRequestCallback("https://grantorrent.foo/series/the-pitt/", "grantorrent-detail-series.html");
+            var indexer = NewIndexer(webClient);
+
+            // the fixture only has S01 rows, so a S02 search must not return them
+            var result = await indexer.ResultsForQuery(
+                new TorznabQuery { QueryType = "tvsearch", SearchTerm = "peaky", Season = 2, Categories = new[] { 5000 } }, false);
+
+            result.Releases.Should().BeEmpty();
+        }
+
+        [Test]
         public async Task TestDownloadAsync()
         {
             _webClient.RegisterRequestCallback("https://grantorrent.foo/operacion-dragon/", "grantorrent-detail.html");
