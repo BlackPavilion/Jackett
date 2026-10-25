@@ -8,9 +8,12 @@
 #     * digest de la imagen base (lscr.io/linuxserver/jackett:latest),
 #     * hash de nuestros ficheros (indexador, Dockerfile, workflow),
 #   y SOLO construye si algo cambió (o si se fuerza manualmente).
-# - Job "build": mergea upstream/master en grantorrent-indexer, compila
+# - Job "build": mergea upstream/master en el árbol de trabajo, compila
 #   Jackett.Common.dll con la versión exacta de la imagen base y publica
 #   ghcr.io/blackpavilion/jackett-grantorrent:latest + :<commit>.
+#   El merge se publica en el branch, salvo los ficheros de .github/workflows
+#   (GITHUB_TOKEN no puede crearlos/modificarlos); si el push falla, el build
+#   continúa igualmente.
 # - Tras un build correcto guarda el estado en
 #   .github/grantorrent-build-state.json (commit en la misma rama).
 #
@@ -173,6 +176,7 @@ jobs:
           fetch-depth: 0
 
       - name: Merge upstream/master
+        id: merge
         run: |
           set -euo pipefail
           git remote add upstream "$UPSTREAM_REPO"
@@ -180,25 +184,35 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          LOCAL=$(git rev-parse HEAD)
-          UPSTREAM=$(git rev-parse upstream/master)
-          MERGE_BASE=$(git merge-base HEAD upstream/master)
+          TIP=$(git rev-parse HEAD)
+          echo "tip=$TIP" >> "$GITHUB_OUTPUT"
 
-          if [ "$LOCAL" = "$UPSTREAM" ] || [ "$MERGE_BASE" = "$UPSTREAM" ]; then
-            echo ">> El branch ya está al día con upstream/master. Sin merge."
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo ">> El branch ya contiene upstream/master. Sin merge."
+            exit 0
+          fi
+
+          echo ">> Mergeando upstream/master en $BRANCH..."
+          git merge upstream/master --no-edit
+
+          # GITHUB_TOKEN no puede publicar commits que crean/modifican ficheros
+          # de .github/workflows/ ("refusing to allow a GitHub App to create or
+          # update workflow ... without `workflows` permission"). Upstream toca
+          # esos ficheros a menudo, así que se conservan los nuestros: el merge
+          # sigue aportando todo el código de Jackett y el push no se rechaza.
+          if ! git diff --quiet "$TIP" HEAD -- .github/workflows; then
+            echo ">> Upstream cambió .github/workflows: se conservan los nuestros."
+            git checkout "$TIP" -- .github/workflows
+            git commit --amend --no-edit
+          fi
+
+          # El build NO depende de este push: si falla, se compila igualmente el
+          # árbol mergeado (la imagen ya llevaría el último upstream). El estado
+          # se registra sobre lo último publicado (ver "Record build state").
+          if git push origin HEAD:"$BRANCH"; then
+            echo ">> Merge publicado en $BRANCH."
           else
-            echo ">> Mergeando upstream/master en $BRANCH..."
-            git merge upstream/master --no-edit
-
-            # Concurrency ya serializa las ejecuciones; este reintento cubre una
-            # carrera puntual (p. ej. un push manual durante el run).
-            if ! git push origin HEAD:"$BRANCH"; then
-              echo ">> Push rechazado; integrando el remoto y reintentando..."
-              git fetch origin "$BRANCH"
-              git merge origin/"$BRANCH" --no-edit
-              git push origin HEAD:"$BRANCH"
-            fi
-            echo ">> Merge pushado."
+            echo "::warning::No se pudo publicar el merge en $BRANCH; se compila el árbol mergeado igualmente."
           fi
 
       - name: Setup .NET SDK
@@ -278,6 +292,12 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # El commit de estado se crea sobre lo ÚLTIMO PUBLICADO en el branch
+          # (no sobre el merge local): así el push siempre es fast-forward aunque
+          # el merge no se haya podido publicar.
+          git fetch origin "$BRANCH"
+          git reset --hard origin/"$BRANCH"
 
           UPSTREAM=$(git rev-parse upstream/master)
           SOURCE_HASH=$(git hash-object \
