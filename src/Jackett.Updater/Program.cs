@@ -322,6 +322,7 @@ namespace Jackett.Updater
                 "Definitions/bitstream.yml",
                 "Definitions/bittorrentam.yml",
                 "Definitions/blubits.yml",
+                "Definitions/bluebird.yml",
                 "Definitions/bluesbrothers.yml",
                 "Definitions/blutopia.yml", // switch to *-API #8682
                 "Definitions/bolly-api.yml",
@@ -703,6 +704,7 @@ namespace Jackett.Updater
                 "Definitions/ptmsg.yml",
                 "Definitions/ptorrent.yml", // renamed to pornxlab
                 "Definitions/ptvicomo.yml",
+                "Definitions/ptying.yml",
                 "Definitions/purovicio.yml",
                 "Definitions/puurhollands.yml",
                 "Definitions/qbite.yml",
