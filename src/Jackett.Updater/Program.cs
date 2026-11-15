@@ -500,7 +500,6 @@ namespace Jackett.Updater
                 "Definitions/hdbits.yml",
                 "Definitions/hdbitscom.yml",
                 "Definitions/hdcenter.yml",
-                "Definitions/hdchina.yml",
                 "Definitions/hdcity.yml", // moved to pixelados
                 "Definitions/hdclub.yml",
                 "Definitions/hdcztorrent.yml",
@@ -533,6 +532,7 @@ namespace Jackett.Updater
                 "Definitions/hqsource.yml",
                 "Definitions/huntorrent-bithorlo.yml", // merged with huntorrent
                 "Definitions/hush.yml",
+                "Definitions/hxpt.yml", // renamed to fluxtorrent
                 "Definitions/hydracker-api.yml",
                 "Definitions/hyperay.yml",
                 "Definitions/ibit.yml",
@@ -669,6 +669,7 @@ namespace Jackett.Updater
                 "Definitions/partis.yml",
                 "Definitions/passionetorrent.yml",
                 "Definitions/peerjunkies.yml",
+                "Definitions/pignetwork.yml",
                 "Definitions/piratadigital.yml",
                 "Definitions/piratbit.yml",
                 "Definitions/piratbitl.yml",
@@ -947,6 +948,7 @@ namespace Jackett.Updater
                 "Definitions/xthor-api.yml",
                 "Definitions/xtremefile.yml",
                 "Definitions/xtremezone.yml", // migrated to C# XtremeZone base tracker
+                "Definitions/xtorrenty.yml",
                 "Definitions/xxxadulttorrent.yml",
                 "Definitions/xxxtorrents.yml",
                 "Definitions/ydypt.yml",
