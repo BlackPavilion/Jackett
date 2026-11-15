@@ -13,7 +13,9 @@
 #   ghcr.io/blackpavilion/jackett-grantorrent:latest + :<commit>.
 #   El merge se publica en el branch, salvo los ficheros de .github/workflows
 #   (GITHUB_TOKEN no puede crearlos/modificarlos); si el push falla, el build
-#   continúa igualmente.
+#   continúa igualmente. Los conflictos de merge en .github/workflows se
+#   resuelven solos conservando los del branch; un conflicto en otra ruta
+#   aborta el job con un mensaje claro.
 # - Tras un build correcto guarda el estado en
 #   .github/grantorrent-build-state.json (commit en la misma rama).
 #
@@ -193,15 +195,47 @@ jobs:
           fi
 
           echo ">> Mergeando upstream/master en $BRANCH..."
+          # "git merge" sale con 1 ante CUALQUIER conflicto, y con `set -e` eso
+          # mataba el job. Los conflictos en .github/workflows son esperables y
+          # se resuelven solos (conservando los nuestros, ver abajo); uno en otra
+          # ruta es real y debe abortar con un mensaje claro.
+          set +e
           git merge upstream/master --no-edit
+          MERGE_RC=$?
+          set -e
+          if [ "$MERGE_RC" -ne 0 ]; then
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
+            OUTSIDE=$(printf '%s\n' "$CONFLICTS" | grep -v '^\.github/workflows/' || true)
+            if [ -z "$CONFLICTS" ] || [ -n "$OUTSIDE" ]; then
+              echo "::error::El merge de upstream/master tiene conflictos que hay que resolver a mano:"
+              printf '%s\n' "$CONFLICTS"
+              git merge --abort
+              exit 1
+            fi
+            echo ">> Conflictos solo en .github/workflows; se conservan los nuestros:"
+            printf '%s\n' "$CONFLICTS"
+            printf '%s\n' "$CONFLICTS" | while IFS= read -r f; do
+              if git cat-file -e "$TIP:$f" 2>/dev/null; then
+                git checkout "$TIP" -- "$f"
+              else
+                git rm -q -f --ignore-unmatch "$f"
+              fi
+            done
+            git commit --no-edit
+          fi
 
           # GITHUB_TOKEN no puede publicar commits que crean/modifican ficheros
           # de .github/workflows/ ("refusing to allow a GitHub App to create or
           # update workflow ... without `workflows` permission"). Upstream toca
-          # esos ficheros a menudo, así que se conservan los nuestros: el merge
-          # sigue aportando todo el código de Jackett y el push no se rechaza.
+          # esos ficheros a menudo, así que se deja ESE DIRECTORIO EXACTAMENTE
+          # como está en TIP: se vacía del índice y se restaura el de TIP, con lo
+          # que también se descartan los ficheros NUEVOS que traiga upstream (con
+          # solo `git checkout $TIP -- .github/workflows` se quedaban y el push
+          # se rechazaba). Así el merge aporta todo el código de Jackett y el
+          # push no se rechaza.
           if ! git diff --quiet "$TIP" HEAD -- .github/workflows; then
             echo ">> Upstream cambió .github/workflows: se conservan los nuestros."
+            git rm -r -q -f --cached .github/workflows
             git checkout "$TIP" -- .github/workflows
             git commit --amend --no-edit
           fi
