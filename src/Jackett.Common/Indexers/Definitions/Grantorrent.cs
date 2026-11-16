@@ -492,7 +492,14 @@ namespace Jackett.Common.Indexers.Definitions
 
             var torrent = await RequestWithCookiesAndRetryAsync(torrentUrl, referer: SiteLink);
             if (torrent.Status == HttpStatusCode.OK)
-                return torrent.ContentBytes;
+            {
+                var bytes = torrent.ContentBytes;
+                // la respuesta vacía no es bencode (empieza por 'd'); un cuerpo nulo
+                // hace petar DownloadController (NRE en BObjectExtensions.EncodeAsBytes)
+                if (bytes.Length == 0 || bytes[0] != 0x64)
+                    throw new Exception($"Empty or non-bencode response from {torrentUrl} (HTTP {torrent.Status}, {bytes.Length} bytes)");
+                return bytes;
+            }
 
             // the primary URL (data-src) did not respond: fall back to the third-party
             // shortener in the button href (super-enlace.com/s.php?i=<5x base64 + ROT13>),
@@ -513,7 +520,12 @@ namespace Jackett.Common.Indexers.Definitions
 
             var fallback = await RequestWithCookiesAndRetryAsync(fallbackUrl, referer: SiteLink);
             if (fallback.Status == HttpStatusCode.OK)
-                return fallback.ContentBytes;
+            {
+                var bytes = fallback.ContentBytes;
+                if (bytes.Length > 0 && bytes[0] == 0x64)
+                    return bytes;
+                throw new Exception($"Empty or non-bencode response from fallback {fallbackUrl} (HTTP {fallback.Status}, {bytes.Length} bytes)");
+            }
 
             throw new Exception($"Failed to download the torrent: primary URL {torrentUrl} (HTTP {(int)torrent.Status}) " +
                                 $"and super-enlace fallback {fallbackUrl} (HTTP {(int)fallback.Status})");
