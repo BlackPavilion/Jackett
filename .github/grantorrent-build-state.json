@@ -1,5 +1,5 @@
 {
   "upstream_commit": "a4ab0fccf65d00f5b7de84a734d9274669b063c1",
-  "base_image_digest": "sha256:653d879518f974b40f2ec59dc8c1d011e5293d175bf4867d7aacbbeb8ed43b28",
+  "base_image_digest": "sha256:6ff71f9c754a64190874851b726461b16e18b7680f237fd6eb9225a0622ec193",
   "source_hash": "410232d4b2449f16226240dda7997add2f28d987"
 }
